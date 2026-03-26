@@ -284,6 +284,13 @@ class MMEncoder:
 
             self.embedding_to_send = dict()
 
+            # Async mooncake state: track background VIT forward completion
+            if self.server_args.encoder_transfer_backend == "mooncake":
+                self._forward_ready_events: Dict[str, asyncio.Event] = {}
+                self._forward_results: Dict[str, dict] = {}
+                self._embedding_dims = self._infer_embedding_dims()
+                self._embedding_dtype = next(self.model.parameters()).dtype
+
         logger.info(f"rank {rank} init finish ")
 
     def _infer_embedding_dims(self) -> dict:
@@ -998,6 +1005,23 @@ class MMEncoder:
         url=None,
     ):
         if self.server_args.encoder_transfer_backend == "mooncake":
+            # Wait for async VIT forward completion if needed
+            req_id = mm_data.req_id
+            if req_id in self._forward_ready_events:
+                logger.info(f"Waiting for VIT forward completion for {req_id}")
+                await self._forward_ready_events[req_id].wait()
+                result = self._forward_results.pop(req_id)
+                self._forward_ready_events.pop(req_id)
+                if "error" in result:
+                    raise InternalError(
+                        f"VIT forward failed: {result['error']}"
+                    )
+                embedding = result["embedding"]
+                logger.info(
+                    f"VIT forward completed for {req_id}, "
+                    f"shape={embedding.shape}, transferring via GPU RDMA"
+                )
+
             self.engine.register(embedding.data_ptr(), embedding.nbytes)
             self.engine.transfer_sync(
                 session_id, embedding.data_ptr(), buffer_address, embedding.nbytes
@@ -1080,6 +1104,122 @@ class MMEncoder:
                 )
                 self.embedding_to_send[req_id] = mm_data
                 logger.debug(f"Created error EmbeddingData: {mm_data}")
+            return 0, 0, 0, error_msg, error_code
+
+    async def encode_async_mooncake(
+        self, mm_items, modality: Modality, req_id, num_parts, part_idx
+    ):
+        """Async encode for mooncake: return metadata immediately, run VIT forward in background."""
+        try:
+            mm_inputs, get_feature_fn = await self._process_mm_items(
+                mm_items, modality
+            )
+            grid_thw = _get_mm_grid_dim(mm_inputs, modality)
+
+            # Compute metadata without running forward
+            total_tokens = sum(
+                self.get_num_tokens(g, modality) for g in grid_thw
+            )
+            embedding_dim = self._embedding_dims.get(
+                modality, self.model_config.hidden_size
+            )
+            element_size = torch.tensor(
+                [], dtype=self._embedding_dtype
+            ).element_size()
+            nbytes = total_tokens * embedding_dim * element_size
+            aux_data = _build_mm_aux_data(mm_inputs)
+
+            if self.rank == 0:
+                # Build mm_item for deferred forward
+                mm_item = MultimodalDataItem.from_dict(
+                    {
+                        "modality": modality,
+                        "feature": _convert(
+                            _get_mm_feature(mm_inputs, modality)
+                        ),
+                    }
+                )
+                for k, v in mm_inputs.items():
+                    if k in _mm_feature_attrs[modality]:
+                        continue
+                    mm_item.set(k, _convert(v))
+
+                # Store metadata (without embedding) for later /send
+                mm_data = EmbeddingData(
+                    req_id,
+                    num_parts,
+                    part_idx,
+                    grid_thw,
+                    modality,
+                    embedding=None,
+                    embedding_shape=[total_tokens, embedding_dim],
+                    **aux_data,
+                )
+                self.embedding_to_send[req_id] = mm_data
+
+                # Set up async forward synchronization
+                event = asyncio.Event()
+                self._forward_ready_events[req_id] = event
+                self._forward_results[req_id] = {}
+
+                # Launch VIT forward in thread pool (non-blocking)
+                loop = asyncio.get_event_loop()
+
+                async def _run_forward():
+                    try:
+                        def _sync_forward():
+                            with torch.inference_mode():
+                                emb = get_feature_fn([mm_item])
+                                # Keep on GPU for zero-copy RDMA
+                                if len(emb.shape) != 2:
+                                    emb = emb.reshape(-1, emb.shape[-1])
+                                return emb
+
+                        emb = await loop.run_in_executor(
+                            self.executor, _sync_forward
+                        )
+                        self._forward_results[req_id]["embedding"] = emb
+                        logger.info(
+                            f"VIT forward completed for {req_id}, "
+                            f"shape={emb.shape}"
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"VIT forward failed for {req_id}: {e}"
+                        )
+                        self._forward_results[req_id]["error"] = str(e)
+                    finally:
+                        event.set()
+
+                task = asyncio.create_task(_run_forward())
+                self.background_tasks.add(task)
+                task.add_done_callback(self.background_tasks.discard)
+
+                logger.info(
+                    f"Returning metadata immediately for {req_id}, "
+                    f"VIT forward running async"
+                )
+
+            return (nbytes, total_tokens, embedding_dim, None, None)
+
+        except Exception as e:
+            error_code = getattr(e, "code", HTTPStatus.INTERNAL_SERVER_ERROR)
+            error_msg = str(e)
+            logger.error(
+                f"Rank {self.rank} encode_async_mooncake failed: "
+                f"{error_msg} {error_code = }"
+            )
+            if self.rank == 0:
+                mm_data = EmbeddingData(
+                    req_id,
+                    num_parts,
+                    part_idx,
+                    None,
+                    modality,
+                    error_msg=error_msg,
+                    error_code=error_code,
+                )
+                self.embedding_to_send[req_id] = mm_data
             return 0, 0, 0, error_msg, error_code
 
     # For zmq_to_tokenizer zmq_to_scheduler and mooncake
@@ -1360,15 +1500,26 @@ async def handle_encode_request(request: dict):
                 )
             )
         else:
-            nbytes, embedding_len, embedding_dim, error_msg, error_code = (
-                await encoder.encode(
-                    mm_items=request["mm_items"],
-                    modality=Modality.from_str(request["modality"]),
-                    req_id=request["req_id"],
-                    num_parts=request["num_parts"],
-                    part_idx=request["part_idx"],
+            if encoder.server_args.encoder_transfer_backend == "mooncake":
+                nbytes, embedding_len, embedding_dim, error_msg, error_code = (
+                    await encoder.encode_async_mooncake(
+                        mm_items=request["mm_items"],
+                        modality=Modality.from_str(request["modality"]),
+                        req_id=request["req_id"],
+                        num_parts=request["num_parts"],
+                        part_idx=request["part_idx"],
+                    )
                 )
-            )
+            else:
+                nbytes, embedding_len, embedding_dim, error_msg, error_code = (
+                    await encoder.encode(
+                        mm_items=request["mm_items"],
+                        modality=Modality.from_str(request["modality"]),
+                        req_id=request["req_id"],
+                        num_parts=request["num_parts"],
+                        part_idx=request["part_idx"],
+                    )
+                )
 
         if error_msg:
             if encoder.server_args.encoder_transfer_backend == "zmq_to_scheduler":

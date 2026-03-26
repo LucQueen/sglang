@@ -288,12 +288,17 @@ class MultiModalEmbeddingData(EmbeddingData):
     def __repr__(self):
         return f"MultiModalEmbeddingData(req_id={self.req_id}, num_parts={self.num_parts}, part_idx={self.part_idx}, modality={self.modality})"
 
-    def get_embedding(self, is_concat=False):
+    def get_embedding(self, is_concat=False, keep_on_gpu=False):
         if is_concat:
             groups = defaultdict(list)
             for i, e in enumerate(self.embedding_list):
                 if e is not None:
                     groups[self.modality_list[i]].append(e.cuda())
+            if keep_on_gpu:
+                return {
+                    mod: torch.concat(tensors)
+                    for mod, tensors in groups.items()
+                }
             return {
                 mod: torch.concat(tensors).to("cpu", non_blocking=True)
                 for mod, tensors in groups.items()
@@ -578,6 +583,243 @@ class WaitingImageRequestGrpc(WaitingImageRequest):
         )
 
 
+class MooncakeRDMAWaitingRequest(WaitingImageRequest):
+    """Waiting request for mooncake RDMA GPU→GPU zero-copy transfer.
+
+    Instead of receiving embeddings via ZMQ, this class:
+    1. Sends POST /encode to get metadata immediately (VIT forward runs async)
+    2. Pre-allocates GPU buffer and registers with Mooncake
+    3. Sends POST /send to trigger RDMA GPU→GPU transfer
+    4. Receives ZMQ ack, extracts embedding from GPU buffer
+    """
+
+    def __init__(self, rid, recv_req, mm_processor, encoder_urls, host_name,
+                 receive_count, embeddings_engine, dtype, gpu_id=0):
+        super().__init__(
+            rid, recv_req, mm_processor, encoder_urls, host_name, receive_count
+        )
+        self.embeddings_engine = embeddings_engine
+        self.dtype = dtype
+        self.gpu_id = gpu_id
+        self.embeddings_buffer = None
+
+    def send_encode_request(self):
+        """Send encode + allocate GPU buffer + send RDMA request."""
+        asyncio.run(self._send_encode_and_rdma_request())
+
+    async def _send_encode_and_rdma_request(self):
+        modalities = list(self.num_items_assigned.keys())
+        _, modality_num_parts = calculate_modality_num_parts(
+            modalities, self.num_items_assigned
+        )
+
+        # Build encode requests (same as WaitingImageRequest)
+        encode_requests = []
+        mm_data_all = []
+        for attr, modality in [
+            ("image_data", Modality.IMAGE),
+            ("video_data", Modality.VIDEO),
+            ("audio_data", Modality.AUDIO),
+        ]:
+            mm_items = getattr(self.recv_req, attr, None)
+            if mm_items:
+                if not isinstance(mm_items, list):
+                    mm_items = [mm_items]
+                for mm_item in mm_items:
+                    mm_data_all.append({
+                        "url": mm_item.url if isinstance(mm_item, ImageData) else mm_item,
+                        "modality": modality,
+                    })
+
+        total_num_parts = sum(modality_num_parts.values())
+        part_idx_offset = 0
+        for modality in modalities:
+            assigned_nums = self.num_items_assigned[modality]
+            num_parts = modality_num_parts[modality]
+            mm_data_modality = [
+                d for d in mm_data_all if d["modality"] == modality
+            ]
+            cum_num_items = 0
+            cum_idx = 0
+            for idx, assigned_num in enumerate(assigned_nums):
+                if assigned_num == 0:
+                    continue
+                part_idx = part_idx_offset + cum_idx
+                part_req_id = create_part_req_id(self.recv_req.rid, part_idx)
+                encode_requests.append({
+                    "encoder_idx": idx,
+                    "mm_items": [
+                        d["url"] for d in mm_data_modality[
+                            cum_num_items:cum_num_items + assigned_num
+                        ]
+                    ],
+                    "num_parts": total_num_parts,
+                    "part_idx": part_idx,
+                    "req_id": part_req_id,
+                    "modality": modality.name,
+                    "prefill_host": self.host_name,
+                    "embedding_port": self.embedding_port,
+                })
+                cum_idx += 1
+                cum_num_items += assigned_num
+            part_idx_offset += num_parts
+
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=1800)
+        ) as session:
+            # Phase 1: POST /encode → get metadata immediately
+            tasks = [
+                session.post(
+                    f"{self.encoder_urls[r['encoder_idx']]}/encode",
+                    json=r,
+                )
+                for r in encode_requests
+            ]
+            responses = await asyncio.gather(*tasks)
+            for resp in responses:
+                if resp.status != 200:
+                    try:
+                        err = await resp.json()
+                        msg = err.get("message", "Unknown error")
+                    except Exception:
+                        msg = await resp.text()
+                    logger.error(f"Encoder returned error {resp.status}: {msg}")
+                    self.status = WaitingImageRequestStatus.FAIL
+                    self.error_msg = msg
+                    return
+
+            response_json_list = [await r.json() for r in responses]
+
+            # Sort by part_idx
+            embedding_sizes = [None] * total_num_parts
+            response_sorted = [None] * total_num_parts
+            for rj in response_json_list:
+                idx = rj["part_idx"]
+                embedding_sizes[idx] = rj["embedding_size"]
+                response_sorted[idx] = rj
+
+            # Phase 2: Pre-allocate GPU buffer and register with Mooncake
+            total_bytes = sum(s for s in embedding_sizes if s is not None)
+            gpu_buffer = torch.empty(
+                total_bytes, dtype=torch.uint8, device=f"cuda:{self.gpu_id}"
+            )
+            self.embeddings_engine.register(
+                gpu_buffer.data_ptr(), gpu_buffer.nbytes
+            )
+            self.embeddings_buffer = gpu_buffer
+            buffer_address = gpu_buffer.data_ptr()
+
+            logger.info(
+                f"Pre-allocated GPU buffer for RDMA: "
+                f"rid={self.rid}, size={total_bytes}, addr={buffer_address}"
+            )
+
+            # Phase 2 cont: POST /send with RDMA info
+            offset = 0
+            send_tasks = []
+            for idx in range(total_num_parts):
+                rj = response_sorted[idx]
+                rj.update({
+                    "session_id": self.embeddings_engine.session_id,
+                    "buffer_address": offset + buffer_address,
+                })
+                send_tasks.append(
+                    session.post(
+                        f"{self.encoder_urls[rj['encoder_idx']]}/send",
+                        json=rj,
+                    )
+                )
+                offset += embedding_sizes[idx]
+
+            # Phase 3: Wait for RDMA transfers to complete
+            await asyncio.gather(*send_tasks)
+            logger.info(f"RDMA transfers completed for rid={self.rid}")
+
+    def _try_recv_mm_data(self):
+        """Extract embedding from GPU buffer after RDMA transfer."""
+        if self.status != WaitingImageRequestStatus.PENDING:
+            return
+        while self.recv_embedding_data is None or not self.recv_embedding_data.ready:
+            try:
+                parts = self.recv_socket.recv_multipart(
+                    flags=zmq.NOBLOCK, copy=False
+                )
+            except zmq.Again:
+                return
+
+            recv_obj: EmbeddingData = pickle.loads(parts[0])
+            if getattr(recv_obj, "error_msg", None) is not None:
+                logger.warning(
+                    f"Received error for {self.rid}: {recv_obj.error_msg}"
+                )
+                self.error_msg = recv_obj.error_msg
+                self.error_code = recv_obj.error_code
+                self.status = WaitingImageRequestStatus.FAIL
+                self._cleanup_gpu_buffer()
+                self.recv_socket.close()
+                return
+
+            # Extract original req_id
+            part_req_id = recv_obj.req_id
+            original_req_id = extract_original_req_id(part_req_id)
+            recv_obj.req_id = original_req_id
+
+            # Embedding is already in GPU buffer via RDMA - no ZMQ data part
+            # recv_obj.embedding stays None until we extract from GPU buffer below
+
+            if self.recv_embedding_data is None:
+                self.recv_embedding_data = (
+                    MultiModalEmbeddingData.from_embedding_data(recv_obj)
+                )
+            else:
+                self.recv_embedding_data.add(recv_obj)
+
+        # Extract embeddings from GPU buffer (already on GPU via RDMA)
+        if self.embeddings_buffer is not None:
+            raw_buffer = self.embeddings_buffer
+            byte_offset = 0
+            for i in range(self.recv_embedding_data.num_parts):
+                shape = self.recv_embedding_data.embedding_shape_list[i]
+                if shape is None:
+                    continue
+                elem_size = torch.tensor([], dtype=self.dtype).element_size()
+                part_bytes = shape[0] * shape[1] * elem_size
+                self.recv_embedding_data.embedding_list[i] = (
+                    raw_buffer[byte_offset:byte_offset + part_bytes]
+                    .view(self.dtype)
+                    .reshape(shape)
+                )
+                byte_offset += part_bytes
+
+        # Keep embeddings on GPU - no D2H transfer
+        recv_embedding = self.recv_embedding_data.get_embedding(
+            is_concat=True, keep_on_gpu=True
+        )
+        mm_inputs = self.mm_processor.get_mm_data(
+            self.recv_req.input_text,
+            recv_embedding,
+            **self.recv_embedding_data.get_mm_extra_meta(),
+        )
+        self.recv_req.mm_inputs = mm_inputs
+        self.recv_req.input_ids = mm_inputs["input_ids"]
+        self.status = WaitingImageRequestStatus.SUCCESS
+        self._cleanup_gpu_buffer()
+        self.recv_socket.close()
+
+    def _cleanup_gpu_buffer(self):
+        """Deregister and release the GPU buffer."""
+        if self.embeddings_buffer is not None:
+            try:
+                self.embeddings_engine.deregister(
+                    self.embeddings_buffer.data_ptr()
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to deregister GPU buffer for rid=%s", self.rid
+                )
+            self.embeddings_buffer = None
+
+
 def _determine_tensor_transport_mode(server_args):
     is_cross_node = server_args.dist_init_addr
 
@@ -619,6 +861,53 @@ class MMReceiverBase(ABC):
                     ),
                 )
             self.embeddings_buffer = dict()
+            # Also init scheduler-side properties for MooncakeRDMAWaitingRequest
+            self.pp_rank = pp_rank
+            self.tp_rank = tp_rank
+            self.tp_size = server_args.tp_size
+            self.tp_group = tp_group
+            self.nnodes = server_args.nnodes
+            self.hostname = get_local_ip_auto()
+            self.waiting_list: List[WaitingImageRequest] = []
+            self.scheduler = scheduler
+            self.wait_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
+            if hf_config is not None:
+                transport_mode = _determine_tensor_transport_mode(server_args)
+                import_processors("sglang.srt.multimodal.processors")
+                _processor = None
+                try:
+                    _processor = get_processor(
+                        server_args.tokenizer_path,
+                        tokenizer_mode=server_args.tokenizer_mode,
+                        trust_remote_code=server_args.trust_remote_code,
+                        revision=server_args.revision,
+                        use_fast=not server_args.disable_fast_image_processor,
+                    )
+                except ValueError as e:
+                    error_message = str(e)
+                    if "does not have a slow version" in error_message:
+                        logger.info(
+                            f"Processor {server_args.tokenizer_path} does not have a slow version. Automatically use fast version"
+                        )
+                        _processor = get_processor(
+                            server_args.tokenizer_path,
+                            tokenizer_mode=server_args.tokenizer_mode,
+                            trust_remote_code=server_args.trust_remote_code,
+                            revision=server_args.revision,
+                            use_fast=True,
+                        )
+                    else:
+                        raise e
+                enable_adaptive_dispatch_to_encoder = (
+                    server_args.enable_adaptive_dispatch_to_encoder
+                )
+                self.mm_processor = get_mm_processor(
+                    hf_config,
+                    server_args,
+                    _processor,
+                    transport_mode,
+                    skip_mm_pool=not enable_adaptive_dispatch_to_encoder,
+                )
         elif self.encoder_transfer_backend == "zmq_to_scheduler":
             self.pp_rank = pp_rank
             self.tp_rank = tp_rank
@@ -814,6 +1103,12 @@ class MMReceiverBase(ABC):
                 mm_data, len(self.encode_urls)
             )
             obj.num_items_assigned = num_items_assigned
+
+            # For mooncake, MooncakeRDMAWaitingRequest on the scheduler
+            # handles the full encode + RDMA flow. No tokenizer-side thread.
+            if self.encoder_transfer_backend == "mooncake":
+                return
+
             encode_thread = threading.Thread(
                 target=self._run_encode_in_thread,
                 args=(
@@ -828,7 +1123,7 @@ class MMReceiverBase(ABC):
             encode_thread.start()
 
     # For zmq_to_scheduler
-    def _process_waiting_requests(self, recv_reqs, waiting_cls):
+    def _process_waiting_requests(self, recv_reqs, waiting_cls, **extra_kwargs):
         new_recv_reqs = []
         for recv_req in recv_reqs:
             if (
@@ -842,6 +1137,7 @@ class MMReceiverBase(ABC):
                     encoder_urls=self.encode_urls,
                     host_name=self.hostname,
                     receive_count=self.tp_size,
+                    **extra_kwargs,
                 )
                 waiting_req.send_encode_request()
                 self.waiting_list.append(waiting_req)
@@ -955,7 +1251,12 @@ class MMReceiverBase(ABC):
         return req
 
     async def allocate_embedding_buffer(self, req_id, total_bytes):
-        embeddings = torch.empty(total_bytes, dtype=torch.uint8)
+        # Allocate GPU buffer for zero-copy RDMA (GPU→GPU, no D2H/H2D)
+        logger.info(
+            f"Pre-allocating GPU buffer for mooncake RDMA: "
+            f"req_id={req_id}, size={total_bytes} bytes"
+        )
+        embeddings = torch.empty(total_bytes, dtype=torch.uint8, device="cuda")
         self.embeddings_engine.register(
             embeddings.data_ptr(),
             embeddings.nbytes,
@@ -1055,8 +1356,18 @@ class MMReceiverHTTP(MMReceiverBase):
             scheduler=scheduler,
         )
 
+
     # For zmq_to_scheduler
     def process_waiting_requests(self, recv_reqs):
+        if self.encoder_transfer_backend == "mooncake":
+            gpu_id = getattr(self.scheduler, "gpu_id", 0)
+            return self._process_waiting_requests(
+                recv_reqs,
+                MooncakeRDMAWaitingRequest,
+                embeddings_engine=self.embeddings_engine,
+                dtype=self.dtype,
+                gpu_id=gpu_id,
+            )
         return self._process_waiting_requests(recv_reqs, WaitingImageRequest)
 
     async def encode(
