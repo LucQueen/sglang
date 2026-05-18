@@ -152,7 +152,7 @@ class EmbeddingData:
             self.shape = embedding_shape
         else:
             self.shape = list(embedding.shape) if embedding is not None else None
-        self.cached_embedding = None
+        self._aaa = None
         self.error_msg = error_msg
         self.error_code = error_code
         # Store additional metadata (e.g., video_timestamps for qwen3_vl)
@@ -627,6 +627,11 @@ class WaitingImageRequestGrpc(WaitingImageRequest):
 
 
 class WaitingImageRDMARequest(WaitingImageRequest):
+    # Class-level shared state for cross-rank metadata coordination.
+    # Rank 0 stores /encode metadata here; other ranks wait on the event.
+    _encode_meta_lock = threading.Lock()
+    _encode_meta: Dict[str, dict] = {}  # rid -> {sizes, sorted, total_bytes, event}
+
     def __init__(
         self,
         rid,
@@ -638,6 +643,8 @@ class WaitingImageRDMARequest(WaitingImageRequest):
         embeddings_engine,
         dtype,
         gpu_id=0,
+        tp_rank=0,
+        tp_group=None,
     ):
         super().__init__(
             rid, recv_req, mm_processor, encoder_urls, host_name, receive_count
@@ -645,9 +652,14 @@ class WaitingImageRDMARequest(WaitingImageRequest):
         self.embeddings_engine = embeddings_engine
         self.dtype = dtype
         self.gpu_id = gpu_id
+        self.tp_rank = tp_rank
+        self.tp_group = tp_group
         self.embeddings_buffer = None
+        self.embeddings_buffer_cpu = None
 
     def send_encode_request(self):
+        # All ranks participate: rank 0 drives /encode + /send, other ranks
+        # wait for metadata then independently alloc buffer + /send.
         self._encode_thread = threading.Thread(
             target=self._run_encode_in_thread, daemon=True
         )
@@ -668,100 +680,142 @@ class WaitingImageRDMARequest(WaitingImageRequest):
         _, modality_num_parts = calculate_modality_num_parts(
             modalities, self.num_items_assigned
         )
-        encode_requests = []
-        # Use the URL list captured at tokenizer time.  TokenizedGenerateReqInput
-        # has no image_data field, so reading recv_req.image_data here would
-        # always return None and produce empty mm_items.
-        mm_data_all = self.recv_req.mm_data_mooncake or []
-
         total_num_parts = sum(modality_num_parts.values())
-        part_idx_offset = 0
-        for modality in modalities:
-            assigned_nums = self.num_items_assigned[modality]
-            num_parts = modality_num_parts[modality]
-            mm_data_modality = [d for d in mm_data_all if d["modality"] == modality]
-            cum_num_items = 0
-            cum_idx = 0
-            for idx, assigned_num in enumerate(assigned_nums):
-                if assigned_num == 0:
-                    continue
-                part_idx = part_idx_offset + cum_idx
-                part_req_id = create_part_req_id(self.recv_req.rid, part_idx)
-                encode_requests.append(
+
+        # Phase 1: Only rank 0 sends /encode to get metadata.
+        # Other ranks wait for rank 0 to populate shared metadata.
+        if self.tp_rank == 0:
+            encode_requests = []
+            mm_data_all = self.recv_req.mm_data_mooncake or []
+
+            part_idx_offset = 0
+            for modality in modalities:
+                assigned_nums = self.num_items_assigned[modality]
+                num_parts = modality_num_parts[modality]
+                mm_data_modality = [d for d in mm_data_all if d["modality"] == modality]
+                cum_num_items = 0
+                cum_idx = 0
+                for idx, assigned_num in enumerate(assigned_nums):
+                    if assigned_num == 0:
+                        continue
+                    part_idx = part_idx_offset + cum_idx
+                    part_req_id = create_part_req_id(self.recv_req.rid, part_idx)
+                    encode_requests.append(
+                        {
+                            "encoder_idx": idx,
+                            "mm_items": [
+                                d["url"]
+                                for d in mm_data_modality[
+                                    cum_num_items : cum_num_items + assigned_num
+                                ]
+                            ],
+                            "num_parts": total_num_parts,
+                            "part_idx": part_idx,
+                            "req_id": part_req_id,
+                            "modality": modality.name,
+                            "prefill_host": self.host_name,
+                            "embedding_port": self.embedding_port,
+                        }
+                    )
+                    cum_idx += 1
+                    cum_num_items += assigned_num
+                part_idx_offset += num_parts
+
+            # Register shared metadata event before starting /encode
+            meta_event = threading.Event()
+            with WaitingImageRDMARequest._encode_meta_lock:
+                WaitingImageRDMARequest._encode_meta[self.rid] = {
+                    "event": meta_event,
+                }
+
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(
+                    total=envs.SGLANG_ENCODER_HTTP_TIMEOUT.get()
+                )
+            ) as session:
+                tasks = [
+                    session.post(
+                        f"{self.encoder_urls[r['encoder_idx']]}/encode",
+                        json=r,
+                    )
+                    for r in encode_requests
+                ]
+                responses = await asyncio.gather(*tasks, return_exceptions=True)
+                if not await self._check_encoder_responses(responses, "/encode"):
+                    meta_event.set()  # Unblock other ranks even on failure
+                    return
+
+                response_json_list = [await r.json() for r in responses]
+                embedding_sizes, response_sorted, total_bytes = (
+                    _sort_responses_and_compute_total_bytes(
+                        response_json_list, total_num_parts
+                    )
+                )
+
+            # Store metadata and signal other ranks
+            with WaitingImageRDMARequest._encode_meta_lock:
+                WaitingImageRDMARequest._encode_meta[self.rid].update(
                     {
-                        "encoder_idx": idx,
-                        "mm_items": [
-                            d["url"]
-                            for d in mm_data_modality[
-                                cum_num_items : cum_num_items + assigned_num
-                            ]
-                        ],
-                        "num_parts": total_num_parts,
-                        "part_idx": part_idx,
-                        "req_id": part_req_id,
-                        "modality": modality.name,
-                        "prefill_host": self.host_name,
-                        "embedding_port": self.embedding_port,
+                        "embedding_sizes": embedding_sizes,
+                        "response_sorted": response_sorted,
+                        "total_bytes": total_bytes,
                     }
                 )
-                cum_idx += 1
-                cum_num_items += assigned_num
-            part_idx_offset += num_parts
+            meta_event.set()
+        else:
+            # Non-rank-0: wait for rank 0 to finish /encode and share metadata
+            while True:
+                with WaitingImageRDMARequest._encode_meta_lock:
+                    meta = WaitingImageRDMARequest._encode_meta.get(self.rid)
+                if meta is not None:
+                    break
+                time.sleep(0.001)
+            meta["event"].wait()
+            embedding_sizes = meta.get("embedding_sizes")
+            if embedding_sizes is None:
+                # Rank 0 failed during /encode
+                self.status = WaitingImageRequestStatus.FAIL
+                self.error_msg = "rank 0 /encode failed"
+                self.recv_socket.close()
+                return
+            response_sorted = meta["response_sorted"]
+            total_bytes = meta["total_bytes"]
+
+        # Phase 2: Each rank independently allocates GPU buffer and sends /send
+        if total_bytes > 0:
+            gpu_buffer = torch.empty(
+                total_bytes, dtype=torch.uint8, device=f"cuda:{self.gpu_id}"
+            )
+            self.embeddings_engine.register(gpu_buffer.data_ptr(), gpu_buffer.nbytes)
+            self.embeddings_buffer = gpu_buffer
+            buffer_address = gpu_buffer.data_ptr()
+
+            logger.info(
+                f"Pre-allocated Mooncake GPU landing buffer: "
+                f"rid={self.rid}, tp_rank={self.tp_rank}, "
+                f"size={total_bytes}, addr={buffer_address}"
+            )
+        else:
+            self.embeddings_buffer = None
+            buffer_address = 0
 
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=envs.SGLANG_ENCODER_HTTP_TIMEOUT.get())
         ) as session:
-            # Phase 1: POST /encode → get metadata immediately
-            tasks = [
-                session.post(
-                    f"{self.encoder_urls[r['encoder_idx']]}/encode",
-                    json=r,
-                )
-                for r in encode_requests
-            ]
-            responses = await asyncio.gather(*tasks, return_exceptions=True)
-            if not await self._check_encoder_responses(responses, "/encode"):
-                return
-
-            response_json_list = [await r.json() for r in responses]
-
-            # Sort by part_idx
-            embedding_sizes, response_sorted, total_bytes = (
-                _sort_responses_and_compute_total_bytes(
-                    response_json_list, total_num_parts
-                )
-            )
-
-            # Phase 2: Pre-allocate and register GPU landing buffer with Mooncake engine
-            # (encode server will write embeddings directly to this address via GPU-direct transfer)
-            if total_bytes > 0:
-                gpu_buffer = torch.empty(
-                    total_bytes, dtype=torch.uint8, device=f"cuda:{self.gpu_id}"
-                )
-                self.embeddings_engine.register(
-                    gpu_buffer.data_ptr(), gpu_buffer.nbytes
-                )
-                self.embeddings_buffer = gpu_buffer
-                buffer_address = gpu_buffer.data_ptr()
-
-                logger.info(
-                    f"Pre-allocated Mooncake GPU landing buffer: "
-                    f"rid={self.rid}, size={total_bytes}, addr={buffer_address}"
-                )
-            else:
-                self.embeddings_buffer = None
-                buffer_address = 0
-
-            # Phase 2 cont: POST /send with RDMA info
             offset = 0
             send_tasks = []
             for idx in range(total_num_parts):
-                rj = response_sorted[idx]
-                encoder_idx = rj.pop("encoder_idx", None)
+                rj = dict(response_sorted[idx])  # Copy to avoid mutating shared data
+                rj.pop("encoder_idx", None)
+                encoder_idx = response_sorted[idx].get("encoder_idx")
                 rj.update(
                     {
                         "session_id": self.embeddings_engine.session_id,
                         "buffer_address": offset + buffer_address,
+                        "receive_count": self.receive_count,
+                        # Override with this rank's own endpoint for ZMQ ack
+                        "prefill_host": self.host_name,
+                        "embedding_port": self.embedding_port,
                     }
                 )
                 send_tasks.append(
@@ -772,13 +826,24 @@ class WaitingImageRDMARequest(WaitingImageRequest):
                 )
                 offset += embedding_sizes[idx]
 
-            # Phase 3: Wait for RDMA transfers to complete
             send_responses = await asyncio.gather(*send_tasks, return_exceptions=True)
             if not await self._check_encoder_responses(
                 send_responses, "/send", on_error=self._cleanup_gpu_buffer
             ):
                 return
-            logger.info(f"RDMA transfers completed for rid={self.rid}")
+            logger.info(
+                f"RDMA transfers completed for rid={self.rid}, tp_rank={self.tp_rank}"
+            )
+
+        # Immediately move GPU buffer to CPU and release GPU memory
+        if self.embeddings_buffer is not None:
+            self.embeddings_buffer_cpu = self.embeddings_buffer.cpu()
+            self._cleanup_gpu_buffer()
+
+        # Clean up shared metadata (last rank to finish cleans up)
+        if self.tp_rank == 0:
+            with WaitingImageRDMARequest._encode_meta_lock:
+                WaitingImageRDMARequest._encode_meta.pop(self.rid, None)
 
     async def _check_encoder_responses(self, responses, endpoint: str, on_error=None):
         """Validate gathered HTTP responses from the encoder.
@@ -820,7 +885,8 @@ class WaitingImageRDMARequest(WaitingImageRequest):
         return True
 
     def _try_recv_mm_data(self):
-        """Extract embedding from GPU buffer after RDMA transfer."""
+        """Extract embedding from GPU buffer after RDMA transfer.
+        All ranks now do RDMA independently and process their own buffer."""
         if self.status != WaitingImageRequestStatus.PENDING:
             return
         while self.recv_embedding_data is None or not self.recv_embedding_data.ready:
@@ -860,12 +926,14 @@ class WaitingImageRDMARequest(WaitingImageRequest):
             else:
                 self.recv_embedding_data.add(recv_obj)
 
-        # Slice pre-registered GPU buffer into per-part tensors; no H2D copy needed
-        # (encode server wrote embeddings directly into this buffer via Mooncake GPU-direct transfer)
-        if self.embeddings_buffer is not None:
-            _slice_embedding_buffer(
-                self.embeddings_buffer, self.recv_embedding_data, self.dtype
-            )
+        # Slice buffer into per-part tensors (CPU buffer after RDMA, or GPU buffer as fallback)
+        buffer = (
+            self.embeddings_buffer_cpu
+            if self.embeddings_buffer_cpu is not None
+            else self.embeddings_buffer
+        )
+        if buffer is not None:
+            _slice_embedding_buffer(buffer, self.recv_embedding_data, self.dtype)
 
         recv_embedding = self.recv_embedding_data.get_embedding(is_concat=True)
         mm_inputs = self.mm_processor.get_mm_data(
@@ -876,7 +944,6 @@ class WaitingImageRDMARequest(WaitingImageRequest):
         self.recv_req.mm_inputs = mm_inputs
         self.recv_req.input_ids = mm_inputs.input_ids
         self.status = WaitingImageRequestStatus.SUCCESS
-        self._cleanup_gpu_buffer()
         self.recv_socket.close()
 
     def _cleanup_gpu_buffer(self):
@@ -1454,6 +1521,8 @@ class MMReceiverHTTP(MMReceiverBase):
                 embeddings_engine=self.embeddings_engine,
                 dtype=self.dtype,
                 gpu_id=gpu_id,
+                tp_rank=self.tp_rank,
+                tp_group=self.tp_group,
             )
         return self._process_waiting_requests(recv_reqs, WaitingImageRequest)
 
