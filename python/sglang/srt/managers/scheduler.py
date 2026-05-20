@@ -1760,7 +1760,18 @@ class Scheduler(
             and self.server_args.encoder_transfer_backend
             in ["zmq_to_scheduler", "mooncake"]
         ):
+            _t0 = time.time()
             recv_reqs, abort_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
+            _elapsed = time.time() - _t0
+            if (
+                _elapsed > 0.1
+                or hasattr(self.mm_receiver, "waiting_list")
+                and len(self.mm_receiver.waiting_list) > 0
+            ):
+                logger.debug(
+                    f"[TIMING] process_waiting_requests: elapsed={_elapsed:.3f}s, "
+                    f"ready={len(recv_reqs)}, still_waiting={len(self.mm_receiver.waiting_list)}"
+                )
             for req, error_msg, error_code in abort_reqs:
                 status_code = (
                     HTTPStatus.BAD_REQUEST

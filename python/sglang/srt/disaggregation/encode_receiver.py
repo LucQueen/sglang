@@ -322,7 +322,14 @@ class MultiModalEmbeddingData(EmbeddingData):
 
     @property
     def ready(self):
-        return sum(self.ready_list) == self.num_parts
+        result = sum(self.ready_list) == self.num_parts
+        if not result:
+            logger.debug(
+                f"[TIMING] EmbeddingData not ready: "
+                f"ready_count={sum(self.ready_list)}/{self.num_parts}, "
+                f"ready_list={self.ready_list}"
+            )
+        return result
 
     def get_mm_extra_meta(self):
         """Build kwargs for mm_processor.get_mm_data() from grid and optional video meta."""
@@ -637,6 +644,8 @@ class WaitingImageRDMARequest(WaitingImageRequest):
         embeddings_engine,
         dtype,
         gpu_id=0,
+        tp_rank=0,
+        tp_group=None,
     ):
         super().__init__(
             rid, recv_req, mm_processor, encoder_urls, host_name, receive_count
@@ -644,9 +653,15 @@ class WaitingImageRDMARequest(WaitingImageRequest):
         self.embeddings_engine = embeddings_engine
         self.dtype = dtype
         self.gpu_id = gpu_id
+        self.tp_rank = tp_rank
+        self.tp_group = tp_group
         self.embeddings_buffer = None
 
     def send_encode_request(self):
+        # Only TP rank 0 sends /encode + /send to encoder.
+        # Other ranks will receive the embedding via NCCL broadcast.
+        if self.tp_rank != 0:
+            return
         self._encode_thread = threading.Thread(
             target=self._run_encode_in_thread, daemon=True
         )
@@ -820,8 +835,12 @@ class WaitingImageRDMARequest(WaitingImageRequest):
             logger.info(f"RDMA transfers completed for rid={self.rid}")
 
     def _try_recv_mm_data(self):
-        """Extract embedding from GPU buffer after RDMA transfer."""
+        """Extract embedding from GPU buffer after RDMA transfer.
+        Only TP rank 0 receives data; other ranks wait for broadcast."""
         if self.status != WaitingImageRequestStatus.PENDING:
+            return
+        # Non-TP0 ranks don't receive ZMQ/RDMA data directly
+        if self.tp_rank != 0:
             return
         while self.recv_embedding_data is None or not self.recv_embedding_data.ready:
             try:
@@ -1220,6 +1239,12 @@ class MMReceiverBase(ABC):
                 waiting_req._cleanup_gpu_buffer()
                 waiting_req.recv_socket.close()
             local_status.append(waiting_req.status)
+            if waiting_req.status == WaitingImageRequestStatus.PENDING:
+                logger.debug(
+                    f"[TIMING] process_waiting: rid={waiting_req.rid} PENDING, "
+                    f"waited={current_time - waiting_req.start_time:.3f}s, "
+                    f"embedding_ready={waiting_req.recv_embedding_data.ready if waiting_req.recv_embedding_data else None}"
+                )
 
         local_status = torch.tensor(local_status, device="cpu", dtype=torch.int32)
 
@@ -1262,6 +1287,129 @@ class MMReceiverBase(ABC):
 
         self.waiting_list = new_waiting
         return new_recv_reqs, abort_reqs
+
+    def _process_waiting_requests_rdma(self, recv_reqs, waiting_cls, **extra_kwargs):
+        """Process waiting requests for mooncake RDMA backend.
+        Only TP rank 0 does /encode + /send + RDMA transfer.
+        TP0 broadcasts status and mm_inputs to other ranks via NCCL."""
+        new_recv_reqs = []
+        for recv_req in recv_reqs:
+            if (
+                isinstance(recv_req, TokenizedGenerateReqInput)
+                and recv_req.need_wait_for_mm_inputs is True
+            ):
+                waiting_req = waiting_cls(
+                    rid=recv_req.rid,
+                    recv_req=recv_req,
+                    mm_processor=self.mm_processor,
+                    encoder_urls=self.encode_urls,
+                    host_name=self.hostname,
+                    receive_count=self.tp_size,
+                    **extra_kwargs,
+                )
+                waiting_req.send_encode_request()
+                self.waiting_list.append(waiting_req)
+            else:
+                new_recv_reqs.append(recv_req)
+
+        if len(self.waiting_list) == 0:
+            return new_recv_reqs, []
+
+        current_time = time.time()
+        local_status = []
+        for waiting_req in self.waiting_list:
+            waiting_req._try_recv_mm_data()
+            if (
+                self.tp_rank == 0
+                and waiting_req.status == WaitingImageRequestStatus.PENDING
+                and current_time - waiting_req.start_time > self.wait_timeout
+            ):
+                waiting_req.status = WaitingImageRequestStatus.TIMEOUT
+                waiting_req._cleanup_gpu_buffer()
+                waiting_req.recv_socket.close()
+            local_status.append(waiting_req.status)
+            if (
+                self.tp_rank == 0
+                and waiting_req.status == WaitingImageRequestStatus.PENDING
+            ):
+                logger.debug(
+                    f"[TIMING] process_waiting_rdma: rid={waiting_req.rid} PENDING, "
+                    f"waited={current_time - waiting_req.start_time:.3f}s, "
+                    f"embedding_ready={waiting_req.recv_embedding_data.ready if waiting_req.recv_embedding_data else None}"
+                )
+
+        # Broadcast status from TP rank 0 to all ranks
+        local_status = torch.tensor(local_status, device="cpu", dtype=torch.int32)
+        torch.distributed.broadcast(
+            local_status,
+            src=self.tp_group.ranks[0],
+            group=self.tp_group.cpu_group,
+        )
+
+        new_waiting = []
+        abort_reqs = []
+        for i, waiting_req in enumerate(self.waiting_list):
+            status_value = local_status[i].item()
+            if status_value == WaitingImageRequestStatus.SUCCESS:
+                # TP0 already has mm_inputs set; broadcast to other ranks
+                self._broadcast_mm_inputs(waiting_req)
+                new_recv_reqs.append(waiting_req.recv_req)
+                if self.tp_rank != 0:
+                    waiting_req.recv_socket.close()
+            elif status_value == WaitingImageRequestStatus.FAIL:
+                logger.error(
+                    f"Waiting request {waiting_req.rid} failed: {waiting_req.error_msg} {waiting_req.error_code = }"
+                )
+                abort_reqs.append(
+                    (
+                        self.create_req(waiting_req.recv_req),
+                        waiting_req.error_msg,
+                        waiting_req.error_code,
+                    )
+                )
+                if self.tp_rank != 0:
+                    waiting_req.recv_socket.close()
+            elif status_value == WaitingImageRequestStatus.TIMEOUT:
+                logger.error(
+                    f"Timed out waiting for image embeddings for request {waiting_req.rid}"
+                )
+                abort_reqs.append(
+                    (
+                        self.create_req(waiting_req.recv_req),
+                        f"Timeout waiting for image embedding after {self.wait_timeout}s",
+                        HTTPStatus.REQUEST_TIMEOUT,
+                    )
+                )
+                if self.tp_rank != 0:
+                    waiting_req.recv_socket.close()
+            else:  # status_value == WaitingImageRequestStatus.PENDING
+                new_waiting.append(waiting_req)
+
+        self.waiting_list = new_waiting
+        return new_recv_reqs, abort_reqs
+
+    def _broadcast_mm_inputs(self, waiting_req):
+        """Broadcast mm_inputs from TP rank 0 to all other ranks after RDMA completion."""
+        if self.tp_size <= 1:
+            return
+
+        recv_req = waiting_req.recv_req
+
+        # Use broadcast_object_list to send mm_inputs dict and input_ids from TP0
+        if self.tp_rank == 0:
+            obj_list = [recv_req.mm_inputs, recv_req.input_ids]
+        else:
+            obj_list = [None, None]
+
+        torch.distributed.broadcast_object_list(
+            obj_list,
+            src=self.tp_group.ranks[0],
+            group=self.tp_group.cpu_group,
+        )
+
+        if self.tp_rank != 0:
+            recv_req.mm_inputs = obj_list[0]
+            recv_req.input_ids = obj_list[1]
 
     def _run_encode_in_thread(
         self, req_id, mm_data, endpoint_encode, num_items_assigned, embedding_port
@@ -1442,12 +1590,14 @@ class MMReceiverHTTP(MMReceiverBase):
     def process_waiting_requests(self, recv_reqs):
         if self.encoder_transfer_backend == "mooncake":
             gpu_id = getattr(self.scheduler, "gpu_id", 0)
-            return self._process_waiting_requests(
+            return self._process_waiting_requests_rdma(
                 recv_reqs,
                 WaitingImageRDMARequest,
                 embeddings_engine=self.embeddings_engine,
                 dtype=self.dtype,
                 gpu_id=gpu_id,
+                tp_rank=self.tp_rank,
+                tp_group=self.tp_group,
             )
         return self._process_waiting_requests(recv_reqs, WaitingImageRequest)
 
