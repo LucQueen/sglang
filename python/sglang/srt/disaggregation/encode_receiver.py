@@ -788,11 +788,21 @@ class WaitingImageRDMARequest(WaitingImageRequest):
             for idx in range(total_num_parts):
                 rj = response_sorted[idx]
                 encoder_idx = rj.pop("encoder_idx", None)
+                part_addr = offset + buffer_address
                 rj.update(
                     {
                         "session_id": self.embeddings_engine.session_id,
-                        "buffer_address": offset + buffer_address,
+                        "buffer_address": part_addr,
                     }
+                )
+                # [EPD-DIAG-SEND] Log RDMA destination per part for cross-rank
+                # comparison (detect address/offset divergence across TP ranks).
+                logger.info(
+                    f"[EPD-DIAG-SEND] gpu={self.gpu_id} rid={self.rid} "
+                    f"enc={encoder_idx} part={idx}/{total_num_parts} "
+                    f"session_id={self.embeddings_engine.session_id} "
+                    f"buf_base=0x{buffer_address:x} offset={offset} "
+                    f"part_addr=0x{part_addr:x} nbytes={embedding_sizes[idx]}"
                 )
                 send_tasks.append(
                     session.post(
@@ -860,8 +870,81 @@ class WaitingImageRDMARequest(WaitingImageRequest):
             _slice_embedding_buffer(
                 self.embeddings_buffer, self.recv_embedding_data, self.dtype
             )
+            # [EPD-DIAG-RDMA-DONE] Dump raw buffer fingerprint right after RDMA
+            # completes (before mm_processor mutates anything) to determine if
+            # TP rank divergence originates at the RDMA layer or downstream.
+            try:
+                buf = self.embeddings_buffer
+                buf_flat = buf.view(-1) if buf.is_contiguous() else buf.reshape(-1)
+                elem_size = torch.tensor([], dtype=self.dtype).element_size()
+                bytes_used = 0
+                shape_list = (
+                    getattr(self.recv_embedding_data, "embedding_shape_list", [])
+                    or []
+                )
+                for shp in shape_list:
+                    if shp is None:
+                        continue
+                    bytes_used += int(shp[0]) * int(shp[1]) * elem_size
+                n_elems = (
+                    bytes_used // buf.element_size() if buf.element_size() else 0
+                )
+                used = buf_flat[:n_elems] if n_elems > 0 else buf_flat[:0]
+                used_view = used.view(self.dtype) if used.numel() else used
+                used_f32 = used_view.float()
+                head = (
+                    used_f32[:8].detach().cpu().tolist() if used_f32.numel() else []
+                )
+                tail = (
+                    used_f32[-8:].detach().cpu().tolist() if used_f32.numel() else []
+                )
+                logger.info(
+                    f"[EPD-DIAG-RDMA-DONE] gpu={self.gpu_id} rid={self.rid} "
+                    f"buf_ptr=0x{buf.data_ptr():x} buf_nbytes={buf.nbytes} "
+                    f"used_nbytes={bytes_used} used_elems={n_elems} "
+                    f"num_parts={self.recv_embedding_data.num_parts} "
+                    f"shapes={shape_list} "
+                    f"sum={float(used_f32.sum()):.3f} "
+                    f"absmax={float(used_f32.abs().max()) if used_f32.numel() else 0.0:.4f} "
+                    f"head={head} tail={tail}"
+                )
+            except Exception as _e:
+                logger.warning(
+                    f"[EPD-DIAG-RDMA-DONE] dump failed rid={self.rid} err={_e}"
+                )
 
         recv_embedding = self.recv_embedding_data.get_embedding(is_concat=True)
+        # [EPD-DIAG-RDMA-DONE-VIEW] Per-modality / per-tensor view fingerprint
+        # after assembly. recv_embedding may be a tensor (single modality) or a
+        # dict (multi-modality), depending on get_embedding() output.
+        try:
+            if isinstance(recv_embedding, dict):
+                for mod, v in recv_embedding.items():
+                    try:
+                        vf = v.float()
+                        vh = vf.flatten()[:6].detach().cpu().tolist()
+                        logger.info(
+                            f"[EPD-DIAG-RDMA-DONE-VIEW] gpu={self.gpu_id} rid={self.rid} "
+                            f"mod={mod} shape={tuple(v.shape)} ptr=0x{v.data_ptr():x} "
+                            f"sum={float(vf.sum()):.3f} head={vh}"
+                        )
+                    except Exception as _ev:
+                        logger.warning(
+                            f"[EPD-DIAG-RDMA-DONE-VIEW] mod={mod} err={_ev}"
+                        )
+            elif recv_embedding is not None:
+                vf = recv_embedding.float()
+                vh = vf.flatten()[:6].detach().cpu().tolist()
+                logger.info(
+                    f"[EPD-DIAG-RDMA-DONE-VIEW] gpu={self.gpu_id} rid={self.rid} "
+                    f"shape={tuple(recv_embedding.shape)} "
+                    f"ptr=0x{recv_embedding.data_ptr():x} "
+                    f"sum={float(vf.sum()):.3f} head={vh}"
+                )
+        except Exception as _e:
+            logger.warning(
+                f"[EPD-DIAG-RDMA-DONE-VIEW] dump failed rid={self.rid} err={_e}"
+            )
         mm_inputs = self.mm_processor.get_mm_data(
             self.recv_req.input_text,
             recv_embedding,

@@ -1372,6 +1372,25 @@ class MMEncoder:
 
             # Register src GPU buffer, push to prefill server's pre-registered landing buffer, then deregister
             self.engine.register(embedding.data_ptr(), embedding.nbytes)
+            # [EPD-DIAG-XFER] Dump source embedding fingerprint + transfer
+            # destination so we can correlate per-rank /send calls and detect
+            # whether all TP ranks pull identical bytes from the encoder.
+            try:
+                _emb_f = embedding.float()
+                _flat = _emb_f.flatten()
+                _head = _flat[:6].detach().cpu().tolist() if _flat.numel() else []
+                logger.info(
+                    f"[EPD-DIAG-XFER] req={req_id} "
+                    f"session_id={session_id} "
+                    f"src_ptr=0x{embedding.data_ptr():x} "
+                    f"dst_addr=0x{buffer_address:x} "
+                    f"nbytes={embedding.nbytes} "
+                    f"src_sum={float(_flat.sum()):.3f} src_head={_head}"
+                )
+            except Exception as _e:
+                logger.warning(
+                    f"[EPD-DIAG-XFER] dump failed req={req_id} err={_e}"
+                )
             self.engine.transfer_sync(
                 session_id, embedding.data_ptr(), buffer_address, embedding.nbytes
             )
